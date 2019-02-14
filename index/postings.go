@@ -14,6 +14,7 @@
 package index
 
 import (
+	"container/heap"
 	"encoding/binary"
 	"runtime"
 	"sort"
@@ -357,6 +358,25 @@ func (it *intersectPostings) Err() error {
 	return it.b.Err()
 }
 
+type PostingsHeap []Postings
+
+func (h PostingsHeap) Len() int           { return len(h) }
+func (h PostingsHeap) Less(i, j int) bool { return h[i].At() < h[j].At() }
+func (h *PostingsHeap) Swap(i, j int)      { (*h)[i], (*h)[j] = (*h)[j], (*h)[i] }
+
+func (h *PostingsHeap) Push(x interface{}) {
+  *h = append(*h, x.(Postings))
+}
+
+func (h *PostingsHeap) Pop() interface{} {
+  old := *h
+  n := len(old)
+  x := old[n-1]
+  *h = old[0 : n-1]
+  return x
+}
+
+
 // Merge returns a new iterator over the union of the input iterators.
 func Merge(its ...Postings) Postings {
 	if len(its) == 0 {
@@ -369,20 +389,26 @@ func Merge(its ...Postings) Postings {
 	// collect everything in a map. This is more efficient
 	// when there's 100ks of postings, compared to
 	// having a tree of merge objects.
-	pm := make(map[uint64]struct{}, len(its))
-	for _, it := range its {
-		for it.Next() {
-			pm[it.At()] = struct{}{}
-		}
-		if it.Err() != nil {
-			return ErrPostings(it.Err())
-		}
-	}
-	pl := make([]uint64, 0, len(pm))
-	for p := range pm {
-		pl = append(pl, p)
-	}
-	sort.Slice(pl, func(i, j int) bool { return pl[i] < pl[j] })
+	pl := []uint64{}
+  h := PostingsHeap(its)
+  heap.Init(&h)
+  var last uint64
+  for h.Len() > 0 {
+    it := h[h.Len()-1]
+    if len(pl) != 0 && it.At() != last {
+      last = it.At()
+      pl = append(pl, last)
+    }
+    if !it.Next() {
+      heap.Pop(&h)
+      if it.Err() != nil {
+        return ErrPostings(it.Err())
+      }
+    } else {
+      heap.Fix(&h, h.Len()-1)
+    }
+
+  }
 	return newListPostings(pl)
 }
 
