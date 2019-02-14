@@ -358,25 +358,6 @@ func (it *intersectPostings) Err() error {
 	return it.b.Err()
 }
 
-type PostingsHeap []Postings
-
-func (h PostingsHeap) Len() int           { return len(h) }
-func (h PostingsHeap) Less(i, j int) bool { return h[i].At() < h[j].At() }
-func (h *PostingsHeap) Swap(i, j int)      { (*h)[i], (*h)[j] = (*h)[j], (*h)[i] }
-
-func (h *PostingsHeap) Push(x interface{}) {
-  *h = append(*h, x.(Postings))
-}
-
-func (h *PostingsHeap) Pop() interface{} {
-  old := *h
-  n := len(old)
-  x := old[n-1]
-  *h = old[0 : n-1]
-  return x
-}
-
-
 // Merge returns a new iterator over the union of the input iterators.
 func Merge(its ...Postings) Postings {
 	if len(its) == 0 {
@@ -385,31 +366,121 @@ func Merge(its ...Postings) Postings {
 	if len(its) == 1 {
 		return its[0]
 	}
-	// All the uses of this function immediately expand it, so
-	// collect everything in a map. This is more efficient
-	// when there's 100ks of postings, compared to
-	// having a tree of merge objects.
-	pl := []uint64{}
-  h := PostingsHeap(its)
-  heap.Init(&h)
-  var last uint64
-  for h.Len() > 0 {
-    it := h[h.Len()-1]
-    if len(pl) != 0 && it.At() != last {
-      last = it.At()
-      pl = append(pl, last)
-    }
-    if !it.Next() {
-      heap.Pop(&h)
-      if it.Err() != nil {
-        return ErrPostings(it.Err())
-      }
-    } else {
-      heap.Fix(&h, h.Len()-1)
-    }
+	return newMergedPostings(its)
+}
 
-  }
-	return newListPostings(pl)
+type PostingsHeap []Postings
+
+func (h PostingsHeap) Len() int           { return len(h) }
+func (h PostingsHeap) Less(i, j int) bool { return h[i].At() < h[j].At() }
+func (h *PostingsHeap) Swap(i, j int)     { (*h)[i], (*h)[j] = (*h)[j], (*h)[i] }
+
+func (h *PostingsHeap) Push(x interface{}) {
+	*h = append(*h, x.(Postings))
+}
+
+func (h *PostingsHeap) Pop() interface{} {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[0 : n-1]
+	return x
+}
+
+type mergedPostings struct {
+	h          PostingsHeap
+	initilized bool
+	cur        uint64
+	err        error
+}
+
+func newMergedPostings(p []Postings) *mergedPostings {
+	ph := make(PostingsHeap, 0, len(p))
+	for _, it := range p {
+		if it.Next() {
+			ph = append(ph, it)
+		} else {
+			if it.Err() != nil {
+				return &mergedPostings{err: it.Err()}
+			}
+		}
+	}
+	heap.Init(&ph)
+	return &mergedPostings{h: ph}
+}
+
+func (it *mergedPostings) Next() bool {
+	if it.h.Len() == 0 || it.err != nil {
+		return false
+	}
+
+	if !it.initilized {
+		it.cur = it.h[0].At()
+		it.initilized = true
+		return true
+	}
+
+	for {
+		cur := it.h[0]
+		if !cur.Next() {
+			heap.Pop(&(it.h))
+			if cur.Err() != nil {
+				it.err = cur.Err()
+				return false
+			}
+			if it.h.Len() == 0 {
+				return false
+			}
+		} else {
+			heap.Fix(&(it.h), 0)
+		}
+
+		cur = it.h[0]
+		if it.h[0].At() != it.cur {
+			it.cur = it.h[0].At()
+			return true
+		}
+	}
+}
+
+func (it *mergedPostings) Seek(id uint64) bool {
+	if it.h.Len() == 0 || it.err != nil {
+		return false
+	}
+	if !it.initilized {
+		if !it.Next() {
+			return false
+		}
+		it.initilized = true
+	}
+	if it.cur >= id {
+		return true
+	}
+	for it.h[0].At() < id {
+		cur := it.h[0]
+		if !cur.Seek(id) {
+			heap.Pop(&(it.h))
+			if cur.Err() != nil {
+				it.err = cur.Err()
+				return false
+			}
+			if it.h.Len() == 0 {
+				return false
+			}
+		} else {
+			heap.Fix(&(it.h), 0)
+		}
+	}
+	it.cur = it.h[0].At()
+	return true
+}
+
+func (it mergedPostings) At() uint64 {
+	return it.cur
+}
+
+func (it mergedPostings) Err() error {
+	return it.err
 }
 
 // Without returns a new postings list that contains all elements from the full list that
@@ -522,6 +593,16 @@ func (it *listPostings) Next() bool {
 func (it *listPostings) Seek(x uint64) bool {
 	// If the current value satisfies, then return.
 	if it.cur >= x {
+		return true
+	}
+	if len(it.list) == 0 {
+		return false
+	}
+
+	// Fast path for stepping one forward.
+	if it.list[0] >= x {
+		it.cur = it.list[0]
+		it.list = it.list[1:]
 		return true
 	}
 
